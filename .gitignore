@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Data and models (large files)
+data/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.tar
+*.tar.gz
+
+# Audio files
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.opus
+*.aac
+*.amr
+
+# Experiment artifacts
+artifacts/experiments/*.jsonl
+artifacts/predictions/
+artifacts/submissions/*.zip
+reports/*.html
+reports/*.json
+mlruns/
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.tmp
+*.log
+build.log
