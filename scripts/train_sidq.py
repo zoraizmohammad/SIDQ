@@ -111,7 +111,10 @@ class SIDQXLSRModel(nn.Module):
         from transformers import Wav2Vec2Model
 
         logger.info("Loading XLS-R 300M from HuggingFace...")
-        self.frontend = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-xls-r-300m")
+        self.frontend = Wav2Vec2Model.from_pretrained(
+            "facebook/wav2vec2-xls-r-300m",
+            attn_implementation="eager",  # MPS doesn't support SDPA with dropout
+        )
         logger.info("XLS-R loaded!")
 
         if freeze_frontend:

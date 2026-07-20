@@ -27,7 +27,17 @@ def load_audio(
     if not path.exists():
         raise FileNotFoundError(f"Audio file not found: {path}")
 
-    waveform, sr = torchaudio.load(str(path))
+    try:
+        waveform, sr = torchaudio.load(str(path))
+    except (ImportError, RuntimeError):
+        import soundfile as sf
+
+        data, sr = sf.read(str(path))
+        waveform = torch.from_numpy(data).float()
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+        else:
+            waveform = waveform.T
 
     if mono and waveform.shape[0] > MONO_CHANNELS:
         waveform = waveform.mean(dim=0, keepdim=True)
