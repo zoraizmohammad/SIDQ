@@ -34,7 +34,7 @@ htmlcov/
 *.key
 
 # Data and models (large files)
-data/
+/data/
 checkpoints/
 *.ckpt
 *.pt
