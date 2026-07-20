@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "SIDQ-T2: Corruption-Aware Self-Supervised Fusion for Robust Arabic Speech Deepfake Detection"
+type: software
+authors:
+  - family-names: Zoraiz
+    given-names: Mohammad
+    email: zoraizmohammad@gmail.com
+version: 0.1.0
+date-released: 2026-07-20
+license: MIT
+repository-code: ""
+keywords:
+  - deepfake-detection
+  - arabic-speech
+  - anti-spoofing
+  - audio-forensics
+  - robustness
