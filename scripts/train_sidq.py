@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -39,9 +40,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from sidq.audio.io import load_audio
 from sidq.augment.curriculum import build_pipeline
-from sidq.constants import LABEL_BONAFIDE, LABEL_SPOOFED, SAMPLE_RATE
+from sidq.constants import LABEL_BONAFIDE, SAMPLE_RATE
 from sidq.evaluation.eer import compute_eer
-from sidq.models.backends.aasist import AASISTBackend
+from sidq.models.sidq_xlsr import SIDQXLSRModel
 from sidq.reproducibility import seed_everything
 
 
@@ -103,40 +104,6 @@ class AraDFDataset(Dataset):
         }
 
 
-class SIDQXLSRModel(nn.Module):
-    """XLS-R 300M + AASIST for anti-spoofing."""
-
-    def __init__(self, freeze_frontend: bool = True, hidden_dim: int = 160):
-        super().__init__()
-        from transformers import Wav2Vec2Model
-
-        logger.info("Loading XLS-R 300M from HuggingFace...")
-        self.frontend = Wav2Vec2Model.from_pretrained(
-            "facebook/wav2vec2-xls-r-300m",
-            attn_implementation="eager",  # MPS doesn't support SDPA with dropout
-        )
-        logger.info("XLS-R loaded!")
-
-        if freeze_frontend:
-            for param in self.frontend.parameters():
-                param.requires_grad = False
-
-        self.backend = AASISTBackend(
-            input_dim=1024,
-            hidden_dim=hidden_dim,
-            num_graph_layers=2,
-            num_classes=2,
-        )
-
-    def forward(self, waveform: torch.Tensor, lengths=None) -> torch.Tensor:
-        with torch.no_grad() if not any(p.requires_grad for p in self.frontend.parameters()) else torch.enable_grad():
-            outputs = self.frontend(waveform)
-            features = outputs.last_hidden_state  # (batch, time, 1024)
-
-        logits = self.backend(features, lengths=lengths)
-        return logits
-
-
 def collate_fn(batch):
     waveforms = torch.stack([item["waveform"] for item in batch])
     labels = torch.tensor([item["label"] for item in batch], dtype=torch.long)
@@ -196,6 +163,23 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--smoke", action="store_true", help="Quick smoke test")
     parser.add_argument("--patience", type=int, default=7)
+    # --- Credit / compute optimization (matters most on metered Colab GPU) ---
+    parser.add_argument("--val-subset", type=int, default=3000,
+                        help="Validate on a fixed random N-clip dev subset each epoch "
+                             "(0 = full dev). Full dev is always evaluated once at the end. "
+                             "Halves per-epoch GPU time on Colab.")
+    parser.add_argument("--limit-train", type=int, default=0,
+                        help="Cap training clips (0 = all 22,500). Use for quick experiments.")
+    parser.add_argument("--max-hours", type=float, default=0.0,
+                        help="Wall-clock budget guard: stop before starting an epoch that "
+                             "would exceed this many hours (0 = no limit). Protects credits.")
+    parser.add_argument("--num-workers", type=int, default=2,
+                        help="DataLoader workers (Colab T4: 2; high-core CPU: more).")
+    parser.add_argument("--resume", type=str, default="",
+                        help="Resume from a checkpoint (restores model+optimizer+best EER).")
+    parser.add_argument("--attn", type=str, default="auto",
+                        choices=["auto", "eager", "sdpa"],
+                        help="XLS-R attention impl. 'auto' = sdpa on CUDA, eager otherwise.")
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -209,6 +193,8 @@ def main():
         device = torch.device("cpu")
     logger.info(f"Device: {device}")
 
+    attn = ("sdpa" if device.type == "cuda" else "eager") if args.attn == "auto" else args.attn
+
     # Load metadata
     train_meta = pd.read_parquet(args.meta_root / "train.parquet")
     val_meta = pd.read_parquet(args.meta_root / "dev.parquet")
@@ -220,26 +206,42 @@ def main():
         args.batch_size = 4
         logger.info("SMOKE TEST MODE: using 64 samples, 2 epochs")
 
+    if args.limit_train and not args.smoke:
+        train_meta = train_meta.sample(
+            n=min(args.limit_train, len(train_meta)), random_state=args.seed
+        ).reset_index(drop=True)
+        logger.info("Limiting training set to %d clips", len(train_meta))
+
+    # Fixed random dev subset for per-epoch validation (cheap, deterministic).
+    # Full dev is still evaluated once at the very end for an honest final number.
+    if args.val_subset and not args.smoke and args.val_subset < len(val_meta):
+        val_sub_meta = val_meta.sample(n=args.val_subset, random_state=args.seed).reset_index(drop=True)
+        logger.info("Per-epoch validation on fixed %d-clip dev subset (full dev at end)",
+                    len(val_sub_meta))
+    else:
+        val_sub_meta = val_meta
+
     # Datasets
     train_dir = args.data_root / "train"
     val_dir = args.data_root / "dev"
 
     train_dataset = AraDFDataset(train_dir, train_meta,
                                  augmentation_profile=args.augmentation, seed=args.seed)
-    val_dataset = AraDFDataset(val_dir, val_meta,
+    val_dataset = AraDFDataset(val_dir, val_sub_meta,
                                augmentation_profile="none", seed=args.seed)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                             shuffle=True, num_workers=2, collate_fn=collate_fn)
+                             shuffle=True, num_workers=args.num_workers, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size * 2,
-                           shuffle=False, num_workers=2, collate_fn=collate_fn)
+                           shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
 
     # Model
-    model = SIDQXLSRModel(freeze_frontend=True, hidden_dim=args.hidden_dim)
+    model = SIDQXLSRModel(freeze_frontend=True, hidden_dim=args.hidden_dim,
+                          attn_implementation=attn)
     model = model.to(device)
 
     # Only train backend parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_params = model.trainable_parameters()
     logger.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
@@ -249,22 +251,49 @@ def main():
     weights = torch.tensor([0.33, 0.67]).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
 
-    # Training loop
+    # Optional resume (restores backend weights, optimizer, best EER, epoch offset)
     best_eer = 1.0
+    start_epoch = 0
     patience_counter = 0
+    if args.resume:
+        logger.info("Resuming from %s", args.resume)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        best_eer = ckpt.get("best_eer", 1.0)
+        start_epoch = ckpt.get("epoch", -1) + 1
+        logger.info("Resumed at epoch %d (best EER %.2f%%)", start_epoch, best_eer * 100)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(args.epochs):
+    # Training loop with wall-clock budget guard
+    t_start = time.time()
+    epoch_times: list[float] = []
+
+    for epoch in range(start_epoch, args.epochs):
+        # Budget guard: don't start an epoch we can't finish within --max-hours.
+        if args.max_hours > 0 and epoch_times:
+            avg = sum(epoch_times) / len(epoch_times)
+            elapsed_h = (time.time() - t_start) / 3600
+            if elapsed_h + avg / 3600 > args.max_hours:
+                logger.info("Stopping: next epoch (~%.2fh) would exceed --max-hours=%.2f "
+                            "(elapsed %.2fh). Credit guard.", avg / 3600, args.max_hours, elapsed_h)
+                break
+
+        t_epoch = time.time()
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
         val_eer, threshold = evaluate(model, val_loader, device)
         scheduler.step()
+        epoch_times.append(time.time() - t_epoch)
 
         logger.info(
             f"Epoch {epoch+1}/{args.epochs} | "
             f"Loss: {train_loss:.4f} | "
             f"Val EER: {val_eer*100:.2f}% | "
             f"Threshold: {threshold:.4f} | "
-            f"LR: {scheduler.get_last_lr()[0]:.2e}"
+            f"LR: {scheduler.get_last_lr()[0]:.2e} | "
+            f"{epoch_times[-1]:.0f}s"
         )
 
         if val_eer < best_eer:
@@ -286,7 +315,20 @@ def main():
                 logger.info(f"Early stopping at epoch {epoch+1}")
                 break
 
-    logger.info(f"Training complete. Best EER: {best_eer*100:.2f}%")
+    # Final honest evaluation on the FULL dev set with the best checkpoint.
+    if not args.smoke and len(val_sub_meta) < len(val_meta):
+        best_ckpt = args.output_dir / "best_sidq.pt"
+        if best_ckpt.exists():
+            state = torch.load(best_ckpt, map_location=device, weights_only=False)
+            model.load_state_dict(state["model_state_dict"], strict=False)
+        full_val_ds = AraDFDataset(val_dir, val_meta, augmentation_profile="none", seed=args.seed)
+        full_val_loader = DataLoader(full_val_ds, batch_size=args.batch_size * 2,
+                                     shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
+        full_eer, full_thr = evaluate(model, full_val_loader, device)
+        logger.info("FULL dev EER (best checkpoint): %.2f%% (threshold %.4f)",
+                    full_eer * 100, full_thr)
+
+    logger.info(f"Training complete. Best (subset) EER: {best_eer*100:.2f}%")
 
 
 if __name__ == "__main__":
