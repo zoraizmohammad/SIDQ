@@ -35,6 +35,7 @@ htmlcov/
 
 # Data and models (large files)
 /data/
+/ArA-DF-2026/
 checkpoints/
 *.ckpt
 *.pt
