@@ -112,10 +112,18 @@ cells.append(code(
     "!git pull --ff-only",
     "!apt-get -qq install -y ffmpeg >/dev/null",
     "# Core deps: torch/torchaudio are preinstalled on Colab. Add the rest.",
-    "!pip install -q -e '.[full]' huggingface_hub hf_transfer 2>&1 | tail -3",
+    "# (Don't hide output — we want to see any real pip error.)",
+    "!pip install -e '.[full]' huggingface_hub hf_transfer",
+    "",
+    "# `pip install -e` writes a .pth that Python only reads at interpreter startup,",
+    "# so the ALREADY-RUNNING kernel won't see `sidq` yet. Add src/ to sys.path now",
+    "# to make the editable package importable without restarting the runtime.",
+    "import sys",
+    "if '/content/SIDQ/src' not in sys.path:",
+    "    sys.path.insert(0, '/content/SIDQ/src')",
+    "",
     "import sidq, torch, transformers",
-    "print('sidq', sidq.__version__ if hasattr(sidq,'__version__') else 'ok',",
-    "      '| torch', torch.__version__, '| transformers', transformers.__version__)",
+    "print('sidq OK | torch', torch.__version__, '| transformers', transformers.__version__)",
 ))
 
 # ---- Section 4: config ----
